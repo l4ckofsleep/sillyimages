@@ -147,7 +147,8 @@ function normalizeNaisteraModel(model) {
 }
 
 function shouldUseNaisteraVideoTest(model) {
-    return normalizeNaisteraModel(model) === 'grok';
+    const normalized = normalizeNaisteraModel(model);
+    return normalized === 'grok' || normalized === 'nano banana';
 }
 
 function normalizeNaisteraVideoFrequency(value) {
@@ -212,23 +213,6 @@ function shouldReplaceEndpointForApiType(apiType, endpoint) {
 
 function getEffectiveEndpoint(settings = getSettings()) {
     return normalizeConfiguredEndpoint(settings.apiType, settings.endpoint);
-}
-
-function buildNaisteraVideoTestPrompt(prompt, style = '') {
-    const cleanPrompt = String(prompt || '').trim();
-    const cleanStyle = String(style || '').trim();
-    const sourceIntent = [cleanStyle ? `style: ${cleanStyle}` : '', cleanPrompt]
-        .filter(Boolean)
-        .join('; ');
-    return [
-        'Create a seamless 6-second looping animation from the generated still image.',
-        'Preserve the exact composition, character design, facial features, pose, outfit, lighting, color palette, and background.',
-        'No camera movement, no cuts, no zoom, no scene changes, no walking, no full-body motion, and no major pose changes.',
-        'Animate only subtle secondary motion: gentle hair sway, loose strands moving, soft cloth drift, and small accessories or jewelry swaying.',
-        'Keep the motion delicate, localized, cyclical, and cleanly loopable.',
-        'Avoid morphing, warping, anatomy changes, blinking, lip movement, hand deformation, and background distortion.',
-        sourceIntent ? `Match the mood and visual intent of the source request: ${sourceIntent}` : '',
-    ].filter(Boolean).join('\n');
 }
 
 /**
@@ -1048,7 +1032,6 @@ async function generateImageNaistera(prompt, style, options = {}) {
     if (wantsVideoTest) {
         body.video_test_mode = true;
         body.video_test_every_n_messages = videoEveryN;
-        body.video_prompt = String(options.videoPrompt || '').trim() || buildNaisteraVideoTestPrompt(prompt, style);
     }
 
     const response = await fetch(url, {
@@ -1248,9 +1231,6 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
                     referenceImages: referenceDataUrls,
                     videoTestMode: enableVideoTest,
                     videoEveryN: settings.naisteraVideoEveryN,
-                    videoPrompt: enableVideoTest
-                        ? buildNaisteraVideoTestPrompt(prompt, style)
-                        : undefined,
                 });
             } else if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
                 generated = await generateImageGemini(prompt, style, referenceImages, options);

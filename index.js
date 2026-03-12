@@ -311,7 +311,7 @@ function extractGeneratedImageUrlsFromText(text) {
     const template = document.createElement('template');
     template.innerHTML = rawText;
     const imageNodes = Array.from(
-        template.content.querySelectorAll('img[data-iig-instruction]')
+        template.content.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]')
     ).reverse();
     for (const node of imageNodes) {
         const src = String(node.getAttribute('src') || '').trim();
@@ -1132,15 +1132,16 @@ function createGeneratedMediaElement(result, tag) {
 }
 
 function buildPersistedVideoTag(templateHtml, persistedSrc, posterSrc = '') {
-    let html = templateHtml
-        .replace(/^<img\b/i, '<video controls autoplay loop muted playsinline')
-        .replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`)
-        .replace(/\/?>\s*$/i, '></video>');
+    let html = String(templateHtml || '').trim()
+        .replace(/^<(?:img|video)\b/i, '<video controls autoplay loop muted playsinline')
+        .replace(/<\/video>\s*$/i, '')
+        .replace(/\/?>\s*$/i, '')
+        .replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
     html = html.replace(/\s+poster\s*=\s*(['"])[\s\S]*?\1/i, '');
     if (posterSrc) {
         html = html.replace(/^<video\b/i, `<video poster="${sanitizeForHtml(posterSrc)}"`);
     }
-    return html;
+    return `${html}></video>`;
 }
 
 /**
@@ -1303,7 +1304,7 @@ async function checkFileExists(path) {
 /**
  * Parse image generation tags from message text
  * Supports two formats:
- * 1. NEW: <img data-iig-instruction='{"style":"...","prompt":"..."}' src="[IMG:GEN]">
+ * 1. NEW: <img|video data-iig-instruction='{"style":"...","prompt":"..."}' src="...">
  * 2. LEGACY: [IMG:GEN:{"style":"...","prompt":"..."}]
  * 
  * @param {string} text - Message text
@@ -1315,7 +1316,7 @@ async function parseImageTags(text, options = {}) {
     const { checkExistence = false, forceAll = false } = options;
     const tags = [];
     
-    // === NEW FORMAT: <img data-iig-instruction="{...}" src="[IMG:GEN]"> ===
+    // === NEW FORMAT: <img|video data-iig-instruction="{...}" src="..."> ===
     // LLM often generates broken HTML with unescaped quotes, so we parse manually
     const imgTagMarker = 'data-iig-instruction=';
     let searchPos = 0;
@@ -1324,9 +1325,13 @@ async function parseImageTags(text, options = {}) {
         const markerPos = text.indexOf(imgTagMarker, searchPos);
         if (markerPos === -1) break;
         
-        // Find the start of the <img tag
-        let imgStart = text.lastIndexOf('<img', markerPos);
-        if (imgStart === -1 || markerPos - imgStart > 500) {
+        // Find the start of the media tag.
+        const imgStart = text.lastIndexOf('<img', markerPos);
+        const videoStart = text.lastIndexOf('<video', markerPos);
+        const mediaStart = Math.max(imgStart, videoStart);
+        const isVideoTag = mediaStart === videoStart && videoStart !== -1;
+        const tagName = isVideoTag ? 'video' : 'img';
+        if (mediaStart === -1 || markerPos - mediaStart > 800) {
             searchPos = markerPos + 1;
             continue;
         }
@@ -1381,15 +1386,25 @@ async function parseImageTags(text, options = {}) {
             continue;
         }
         
-        // Find the end of the <img> tag
-        let imgEnd = text.indexOf('>', jsonEnd);
-        if (imgEnd === -1) {
+        // Find the end of the media tag.
+        let mediaEnd = -1;
+        if (isVideoTag) {
+            mediaEnd = text.indexOf('</video>', jsonEnd);
+            if (mediaEnd !== -1) {
+                mediaEnd += '</video>'.length;
+            }
+        } else {
+            mediaEnd = text.indexOf('>', jsonEnd);
+            if (mediaEnd !== -1) {
+                mediaEnd += 1;
+            }
+        }
+        if (mediaEnd === -1) {
             searchPos = markerPos + 1;
             continue;
         }
-        imgEnd++; // Include the >
-        
-        const fullImgTag = text.substring(imgStart, imgEnd);
+
+        const fullImgTag = text.substring(mediaStart, mediaEnd);
         const instructionJson = text.substring(jsonStart, jsonEnd);
         
         // Check if src needs generation
@@ -1451,7 +1466,7 @@ async function parseImageTags(text, options = {}) {
             
             tags.push({
                 fullMatch: fullImgTag,
-                index: imgStart,
+                index: mediaStart,
                 style: data.style || '',
                 prompt: data.prompt || '',
                 aspectRatio: data.aspect_ratio || data.aspectRatio || null,
@@ -1459,6 +1474,7 @@ async function parseImageTags(text, options = {}) {
                 imageSize: data.image_size || data.imageSize || null,
                 quality: data.quality || null,
                 isNewFormat: true,
+                mediaTagName: tagName,
                 existingSrc: hasPath ? srcValue : null // Store existing src for logging
             });
             
@@ -1467,7 +1483,7 @@ async function parseImageTags(text, options = {}) {
             iigLog('WARN', `Failed to parse instruction JSON: ${instructionJson.substring(0, 100)}`, e.message);
         }
         
-        searchPos = imgEnd;
+        searchPos = mediaEnd;
     }
     
     // === LEGACY FORMAT: [IMG:GEN:{...}] ===
@@ -1655,10 +1671,9 @@ async function processMessageTags(messageId) {
         let targetElement = null;
         
         if (tag.isNewFormat) {
-            // NEW FORMAT: <img data-iig-instruction='...'> is a real DOM element
-            // Find it by looking for img with data-iig-instruction attribute
-            const allImgs = mesTextEl.querySelectorAll('img[data-iig-instruction]');
-            iigLog('INFO', `Searching for img element. Found ${allImgs.length} img[data-iig-instruction] elements in DOM`);
+            // NEW FORMAT: <img|video data-iig-instruction='...'> is a real DOM element
+            const allImgs = mesTextEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]');
+            iigLog('INFO', `Searching for media element. Found ${allImgs.length} [data-iig-instruction] elements in DOM`);
             
             // Debug: log what we're looking for vs what's in DOM
             const searchPrompt = tag.prompt.substring(0, 30);
@@ -1730,11 +1745,11 @@ async function processMessageTags(messageId) {
                 }
             }
             
-            // Strategy 4: If still not found, try looking at ALL imgs (not just those with data-iig-instruction attr)
+            // Strategy 4: If still not found, try looking at all media nodes
             // This handles cases where browser didn't parse data-iig-instruction as a valid attribute
             if (!targetElement) {
-                iigLog('INFO', `Trying broader img search...`);
-                const allImgsInMes = mesTextEl.querySelectorAll('img');
+                iigLog('INFO', `Trying broader media search...`);
+                const allImgsInMes = mesTextEl.querySelectorAll('img, video');
                 for (const img of allImgsInMes) {
                     const src = img.getAttribute('src') || '';
                     // Look for src containing our markers
@@ -1765,7 +1780,7 @@ async function processMessageTags(messageId) {
             
             // Also check for img src containing legacy tag
             if (!targetElement) {
-                const allImgs = mesTextEl.querySelectorAll('img');
+                const allImgs = mesTextEl.querySelectorAll('img, video');
                 for (const img of allImgs) {
                     if (img.src && img.src.includes('[IMG:GEN:')) {
                         targetElement = img;
@@ -1969,7 +1984,10 @@ async function regenerateMessageImages(messageId) {
         
         try {
             // Find the existing rendered media element with data-iig-instruction
-            const existingMedia = mesTextEl.querySelector(`[data-iig-instruction]`);
+            const existingMediaList = Array.from(
+                mesTextEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]')
+            );
+            const existingMedia = existingMediaList[index] || existingMediaList[0] || null;
             if (existingMedia) {
                 // Preserve the instruction for future regenerations
                 const instruction = existingMedia.getAttribute('data-iig-instruction');

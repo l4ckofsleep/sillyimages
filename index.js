@@ -1312,17 +1312,9 @@ function buildPersistedVideoTag(templateHtml, persistedSrc, posterSrc = '') {
     return `${html}></video>`;
 }
 
-function buildPersistedLegacyImageTag(tag, persistedSrc) {
+function buildPendingLegacyTag(tag) {
     const instruction = sanitizeForSingleQuotedAttribute(getInstructionAttributeValue(tag));
-    const src = sanitizeForHtml(persistedSrc);
-    return `<img data-iig-instruction='${instruction}' src="${src}">`;
-}
-
-function buildPersistedLegacyVideoTag(tag, persistedSrc, posterSrc = '') {
-    const instruction = sanitizeForSingleQuotedAttribute(getInstructionAttributeValue(tag));
-    const src = sanitizeForHtml(persistedSrc);
-    const posterAttr = posterSrc ? ` poster="${sanitizeForHtml(posterSrc)}"` : '';
-    return `<video data-iig-instruction='${instruction}' src="${src}"${posterAttr} controls autoplay loop muted playsinline></video>`;
+    return `<img data-iig-instruction='${instruction}' src="[IMG:GEN]">`;
 }
 
 /**
@@ -1831,6 +1823,33 @@ async function processMessageTags(messageId) {
     
     const mesTextEl = messageElement.querySelector('.mes_text');
     if (!mesTextEl) return;
+
+    let convertedLegacyTags = 0;
+    for (const tag of tags) {
+        if (tag.isNewFormat) {
+            continue;
+        }
+
+        const pendingTag = buildPendingLegacyTag(tag);
+        replaceTagInMessageSource(message, tag, pendingTag);
+        tag.fullMatch = pendingTag;
+        tag.isNewFormat = true;
+        convertedLegacyTags += 1;
+    }
+
+    if (convertedLegacyTags > 0) {
+        const formattedMessage = typeof context.messageFormatting === 'function'
+            ? context.messageFormatting(
+                getMessageRenderText(message, settings),
+                message.name,
+                message.is_system,
+                message.is_user,
+                messageId
+            )
+            : getMessageRenderText(message, settings);
+        mesTextEl.innerHTML = formattedMessage;
+        iigLog('INFO', `Converted ${convertedLegacyTags} legacy tag(s) to instruction tags before processing`);
+    }
     
     // Process each tag in parallel
     const processTag = async (tag, index) => {
@@ -1842,123 +1861,92 @@ async function processMessageTags(messageId) {
         const loadingPlaceholder = createLoadingPlaceholder(tagId);
         let targetElement = null;
         
-        if (tag.isNewFormat) {
-            // NEW FORMAT: <img|video data-iig-instruction='...'> is a real DOM element
-            const allImgs = mesTextEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]');
-            iigLog('INFO', `Searching for media element. Found ${allImgs.length} [data-iig-instruction] elements in DOM`);
+        // NEW FORMAT: <img|video data-iig-instruction='...'> is a real DOM element
+        const allImgs = mesTextEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]');
+        iigLog('INFO', `Searching for media element. Found ${allImgs.length} [data-iig-instruction] elements in DOM`);
+        
+        // Debug: log what we're looking for vs what's in DOM
+        const searchPrompt = tag.prompt.substring(0, 30);
+        iigLog('INFO', `Searching for prompt starting with: "${searchPrompt}"`);
+        
+        for (const img of allImgs) {
+            const instruction = img.getAttribute('data-iig-instruction');
+            const src = img.getAttribute('src') || '';
+            iigLog('INFO', `DOM img - src: "${src.substring(0, 50)}", instruction (first 100): "${instruction?.substring(0, 100)}"`);
             
-            // Debug: log what we're looking for vs what's in DOM
-            const searchPrompt = tag.prompt.substring(0, 30);
-            iigLog('INFO', `Searching for prompt starting with: "${searchPrompt}"`);
-            
-            for (const img of allImgs) {
-                const instruction = img.getAttribute('data-iig-instruction');
-                const src = img.getAttribute('src') || '';
-                iigLog('INFO', `DOM img - src: "${src.substring(0, 50)}", instruction (first 100): "${instruction?.substring(0, 100)}"`);
+            // Try multiple matching strategies
+            if (instruction) {
+                // Strategy 1: Decode HTML entities and normalize quotes, then match
+                const decodedInstruction = instruction
+                    .replace(/&quot;/g, '"')
+                    .replace(/&apos;/g, "'")
+                    .replace(/&#39;/g, "'")
+                    .replace(/&#34;/g, '"')
+                    .replace(/&amp;/g, '&');
                 
-                // Try multiple matching strategies
-                if (instruction) {
-                    // Strategy 1: Decode HTML entities and normalize quotes, then match
-                    const decodedInstruction = instruction
-                        .replace(/&quot;/g, '"')
-                        .replace(/&apos;/g, "'")
-                        .replace(/&#39;/g, "'")
-                        .replace(/&#34;/g, '"')
-                        .replace(/&amp;/g, '&');
-                    
-                    // Also normalize the search prompt the same way
-                    const normalizedSearchPrompt = searchPrompt
-                        .replace(/&quot;/g, '"')
-                        .replace(/&apos;/g, "'")
-                        .replace(/&#39;/g, "'")
-                        .replace(/&#34;/g, '"')
-                        .replace(/&amp;/g, '&');
-                    
-                    // Check if decoded instruction contains the prompt
-                    if (decodedInstruction.includes(normalizedSearchPrompt)) {
-                        iigLog('INFO', `Found img element via decoded instruction match`);
+                // Also normalize the search prompt the same way
+                const normalizedSearchPrompt = searchPrompt
+                    .replace(/&quot;/g, '"')
+                    .replace(/&apos;/g, "'")
+                    .replace(/&#39;/g, "'")
+                    .replace(/&#34;/g, '"')
+                    .replace(/&amp;/g, '&');
+                
+                // Check if decoded instruction contains the prompt
+                if (decodedInstruction.includes(normalizedSearchPrompt)) {
+                    iigLog('INFO', `Found img element via decoded instruction match`);
+                    targetElement = img;
+                    break;
+                }
+                
+                // Strategy 2: Try to parse the instruction as JSON and compare prompts
+                try {
+                    const normalizedJson = decodedInstruction.replace(/'/g, '"');
+                    const instructionData = JSON.parse(normalizedJson);
+                    if (instructionData.prompt && instructionData.prompt.substring(0, 30) === tag.prompt.substring(0, 30)) {
+                        iigLog('INFO', `Found img element via JSON prompt match`);
                         targetElement = img;
                         break;
                     }
-                    
-                    // Strategy 2: Try to parse the instruction as JSON and compare prompts
-                    try {
-                        const normalizedJson = decodedInstruction.replace(/'/g, '"');
-                        const instructionData = JSON.parse(normalizedJson);
-                        if (instructionData.prompt && instructionData.prompt.substring(0, 30) === tag.prompt.substring(0, 30)) {
-                            iigLog('INFO', `Found img element via JSON prompt match`);
-                            targetElement = img;
-                            break;
-                        }
-                    } catch (e) {
-                        // JSON parse failed, continue with other strategies
-                    }
-                    
-                    // Strategy 3: Raw instruction contains raw search prompt (original approach)
-                    if (instruction.includes(searchPrompt)) {
-                        iigLog('INFO', `Found img element via raw instruction match`);
-                        targetElement = img;
-                        break;
-                    }
+                } catch (e) {
+                    // JSON parse failed, continue with other strategies
+                }
+                
+                // Strategy 3: Raw instruction contains raw search prompt (original approach)
+                if (instruction.includes(searchPrompt)) {
+                    iigLog('INFO', `Found img element via raw instruction match`);
+                    targetElement = img;
+                    break;
                 }
             }
-            
-            // Alternative: find by src containing markers (when prompt matching fails)
-            if (!targetElement) {
-                iigLog('INFO', `Prompt matching failed, trying src marker matching...`);
-                for (const img of allImgs) {
-                    const src = img.getAttribute('src') || '';
-                    // Check for generation markers or empty/broken src
-                    if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]') || src === '' || src === '#') {
-                        iigLog('INFO', `Found img element with generation marker in src: "${src}"`);
-                        targetElement = img;
-                        break;
-                    }
+        }
+        
+        // Alternative: find by src containing markers (when prompt matching fails)
+        if (!targetElement) {
+            iigLog('INFO', `Prompt matching failed, trying src marker matching...`);
+            for (const img of allImgs) {
+                const src = img.getAttribute('src') || '';
+                // Check for generation markers or empty/broken src
+                if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]') || src === '' || src === '#') {
+                    iigLog('INFO', `Found img element with generation marker in src: "${src}"`);
+                    targetElement = img;
+                    break;
                 }
             }
-            
-            // Strategy 4: If still not found, try looking at all media nodes
-            // This handles cases where browser didn't parse data-iig-instruction as a valid attribute
-            if (!targetElement) {
-                iigLog('INFO', `Trying broader media search...`);
-                const allImgsInMes = mesTextEl.querySelectorAll('img, video');
-                for (const img of allImgsInMes) {
-                    const src = img.getAttribute('src') || '';
-                    // Look for src containing our markers
-                    if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]')) {
-                        iigLog('INFO', `Found img via broad search with marker src: "${src.substring(0, 50)}"`);
-                        targetElement = img;
-                        break;
-                    }
-                }
-            }
-        } else {
-            // LEGACY FORMAT: [IMG:GEN:{...}] - use regex replacement
-            const tagEscaped = tag.fullMatch
-                .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-                .replace(/"/g, '(?:"|&quot;)');
-            const tagRegex = new RegExp(tagEscaped, 'g');
-            
-            const beforeReplace = mesTextEl.innerHTML;
-            mesTextEl.innerHTML = mesTextEl.innerHTML.replace(
-                tagRegex,
-                `<span data-iig-placeholder="${tagId}"></span>`
-            );
-            
-            if (beforeReplace !== mesTextEl.innerHTML) {
-                targetElement = mesTextEl.querySelector(`[data-iig-placeholder="${tagId}"]`);
-                iigLog('INFO', `Legacy tag replaced with placeholder span`);
-            }
-            
-            // Also check for img src containing legacy tag
-            if (!targetElement) {
-                const allImgs = mesTextEl.querySelectorAll('img, video');
-                for (const img of allImgs) {
-                    if (img.src && img.src.includes('[IMG:GEN:')) {
-                        targetElement = img;
-                        iigLog('INFO', `Found img with legacy tag in src`);
-                        break;
-                    }
+        }
+        
+        // Strategy 4: If still not found, try looking at all media nodes
+        // This handles cases where browser didn't parse data-iig-instruction as a valid attribute
+        if (!targetElement) {
+            iigLog('INFO', `Trying broader media search...`);
+            const allImgsInMes = mesTextEl.querySelectorAll('img, video');
+            for (const img of allImgsInMes) {
+                const src = img.getAttribute('src') || '';
+                // Look for src containing our markers
+                if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]')) {
+                    iigLog('INFO', `Found img via broad search with marker src: "${src.substring(0, 50)}"`);
+                    targetElement = img;
+                    break;
                 }
             }
         }
@@ -1981,7 +1969,7 @@ async function processMessageTags(messageId) {
         }
         
         const statusEl = loadingPlaceholder.querySelector('.iig-status');
-        
+
         try {
             const generated = await generateImageWithRetry(
                 tag.prompt,
@@ -2033,17 +2021,10 @@ async function processMessageTags(messageId) {
 
             loadingPlaceholder.replaceWith(mediaElement);
 
-            if (tag.isNewFormat) {
-                const updatedTag = isGeneratedVideoResult(generated)
-                    ? buildPersistedVideoTag(tag.fullMatch, persistedSrc, persistedPosterSrc)
-                    : tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
-                replaceTagInMessageSource(message, tag, updatedTag);
-            } else {
-                const persistedTag = isGeneratedVideoResult(generated)
-                    ? buildPersistedLegacyVideoTag(tag, persistedSrc, persistedPosterSrc)
-                    : buildPersistedLegacyImageTag(tag, persistedSrc);
-                replaceTagInMessageSource(message, tag, persistedTag);
-            }
+            const updatedTag = isGeneratedVideoResult(generated)
+                ? buildPersistedVideoTag(tag.fullMatch, persistedSrc, persistedPosterSrc)
+                : tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
+            replaceTagInMessageSource(message, tag, updatedTag);
 
             iigLog('INFO', `Successfully generated ${isGeneratedVideoResult(generated) ? 'video' : 'image'} for tag ${index}`);
             toastr.success(

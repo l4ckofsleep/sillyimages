@@ -1,7 +1,6 @@
 /**
  * Inline Image Generation Extension for SillyTavern
- * 
- * Catches [IMG:GEN:{json}] tags in AI messages and generates images via configured API.
+ * * Catches [IMG:GEN:{json}] tags in AI messages and generates images via configured API.
  * Supports OpenAI-compatible and Gemini-compatible (nano-banana) endpoints.
  */
 
@@ -138,8 +137,8 @@ const DEFAULT_ENDPOINTS = Object.freeze({
     naistera: 'https://naistera.org',
 });
 const ENDPOINT_PLACEHOLDERS = Object.freeze({
-    openai: 'https://api.openai.com',
-    gemini: 'https://generativelanguage.googleapis.com',
+    openai: 'Полный URL (напр. https://api.openai.com/v1/images/generations)',
+    gemini: 'Полный URL эндпоинта',
     naistera: 'https://naistera.org',
 });
 
@@ -197,7 +196,7 @@ function shouldTriggerNaisteraVideoForMessage(messageId, everyN) {
 }
 
 function getEndpointPlaceholder(apiType) {
-    return ENDPOINT_PLACEHOLDERS[apiType] || 'https://api.example.com';
+    return ENDPOINT_PLACEHOLDERS[apiType] || 'Укажите полный URL эндпоинта';
 }
 
 function normalizeConfiguredEndpoint(apiType, endpoint) {
@@ -1091,7 +1090,8 @@ async function getUserAvatarBase64() {
  */
 async function generateImageOpenAI(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
-    const url = `${settings.endpoint.replace(/\/$/, '')}/v1/images/generations`;
+    // ВАЖНО: Используем эндпоинт целиком, без автоматического дописывания /v1/images/generations
+    const url = settings.endpoint.trim();
     
     // Combine style and prompt
     const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
@@ -1163,7 +1163,8 @@ const VALID_IMAGE_SIZES = ['1K', '2K', '4K'];
 async function generateImageGemini(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
     const model = settings.model;
-    const url = `${settings.endpoint.replace(/\/$/, '')}/v1beta/models/${model}:generateContent`;
+    // ВАЖНО: Используем эндпоинт целиком, без автоматического дописывания /v1beta/models/...
+    const url = settings.endpoint.trim();
     
     // Determine aspect ratio: tag option > settings, with validation
     let aspectRatio = options.aspectRatio || settings.aspectRatio || '1:1';
@@ -1802,8 +1803,7 @@ async function checkFileExists(path) {
  * Supports two formats:
  * 1. NEW: <img|video data-iig-instruction='{"style":"...","prompt":"..."}' src="...">
  * 2. LEGACY: [IMG:GEN:{"style":"...","prompt":"..."}]
- * 
- * @param {string} text - Message text
+ * * @param {string} text - Message text
  * @param {object} options - Options
  * @param {boolean} options.checkExistence - Check if image files exist (for hallucination detection)
  * @param {boolean} options.forceAll - Include all instruction tags even with valid paths (for regeneration)
@@ -2615,7 +2615,6 @@ function createSettingsUI() {
             </div>
             <div class="inline-drawer-content">
                 <div class="iig-settings">
-                    <!-- Вкл/Выкл -->
                     <label class="checkbox_label">
                         <input type="checkbox" id="iig_enabled" ${settings.enabled ? 'checked' : ''}>
                         <span>Включить генерацию картинок</span>
@@ -2629,7 +2628,6 @@ function createSettingsUI() {
                     
                     <h4>Настройки API</h4>
                     
-                    <!-- Тип эндпоинта -->
                     <div class="flex-row">
                         <label for="iig_api_type">Тип API</label>
                         <select id="iig_api_type" class="flex1">
@@ -2639,15 +2637,13 @@ function createSettingsUI() {
                         </select>
                     </div>
                     
-                    <!-- URL эндпоинта -->
                     <div class="flex-row">
                         <label for="iig_endpoint">URL эндпоинта</label>
                         <input type="text" id="iig_endpoint" class="text_pole flex1" 
                                value="${settings.endpoint}" 
-                               placeholder="https://api.example.com">
+                               placeholder="Укажите полный URL...">
                     </div>
                     
-                    <!-- API ключ -->
                     <div class="flex-row">
                         <label for="iig_api_key">API ключ</label>
                         <input type="password" id="iig_api_key" class="text_pole flex1" 
@@ -2658,7 +2654,6 @@ function createSettingsUI() {
                     </div>
                     <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera: вставьте токен из Telegram бота и выберите модель (grok / nano banana).</p>
                     
-                    <!-- Модель -->
                     <div class="flex-row ${settings.apiType === 'naistera' ? 'iig-hidden' : ''}" id="iig_model_row">
                         <label for="iig_model">Модель</label>
                         <select id="iig_model" class="flex1">
@@ -2698,7 +2693,6 @@ function createSettingsUI() {
                     <div class="iig-settings-card">
                         <h4>Параметры генерации</h4>
 
-                        <!-- Размер -->
                         <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_size_row">
                             <label for="iig_size">Размер</label>
                             <select id="iig_size" class="flex1">
@@ -2709,7 +2703,6 @@ function createSettingsUI() {
                             </select>
                         </div>
 
-                        <!-- Качество -->
                         <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_quality_row">
                             <label for="iig_quality">Качество</label>
                             <select id="iig_quality" class="flex1">

@@ -99,14 +99,11 @@ const VIDEO_MODEL_KEYWORDS = [
     'vidu', 'wan-ai', 'hunyuan', 'hailuo'
 ];
 
-// We'll parse tags manually since JSON can contain nested braces
-// Tag format: [IMG:GEN:{...json...}] or <img src="[IMG:GEN:{...json...}]">
-
 /**
  * Check if model ID is an image generation model
  */
 function isImageModel(modelId) {
-    const mid = modelId.toLowerCase();
+    const mid = String(modelId || '').toLowerCase();
     
     // Exclude video models
     for (const kw of VIDEO_MODEL_KEYWORDS) {
@@ -128,7 +125,7 @@ function isImageModel(modelId) {
  * Check if model is Gemini/nano-banana type
  */
 function isGeminiModel(modelId) {
-    const mid = modelId.toLowerCase();
+    const mid = String(modelId || '').toLowerCase();
     return mid.includes('nano-banana');
 }
 
@@ -137,8 +134,8 @@ const DEFAULT_ENDPOINTS = Object.freeze({
     naistera: 'https://naistera.org',
 });
 const ENDPOINT_PLACEHOLDERS = Object.freeze({
-    openai: 'Полный URL (напр. https://api.openai.com/v1/images/generations)',
-    gemini: 'Полный URL эндпоинта',
+    openai: 'Полный ручной URL (напр. https://api.openai.com/v1/images/generations)',
+    gemini: 'Полный ручной URL (напр. https://.../v1beta/models/nano-banana:generateContent)',
     naistera: 'https://naistera.org',
 });
 
@@ -197,30 +194,6 @@ function shouldTriggerNaisteraVideoForMessage(messageId, everyN) {
 
 function getEndpointPlaceholder(apiType) {
     return ENDPOINT_PLACEHOLDERS[apiType] || 'Укажите полный URL эндпоинта';
-}
-
-function normalizeConfiguredEndpoint(apiType, endpoint) {
-    const trimmed = String(endpoint || '').trim().replace(/\/+$/, '');
-    if (!trimmed) {
-        return apiType === 'naistera' ? DEFAULT_ENDPOINTS.naistera : '';
-    }
-    if (apiType === 'naistera') {
-        return trimmed.replace(/\/api\/generate$/i, '');
-    }
-    return trimmed;
-}
-
-function shouldReplaceEndpointForApiType(apiType, endpoint) {
-    const trimmed = String(endpoint || '').trim();
-    if (!trimmed) return true;
-    if (apiType !== 'naistera') return false;
-    return /\/v1\/images\/generations\/?$/i.test(trimmed)
-        || /\/v1\/models\/?$/i.test(trimmed)
-        || /\/v1beta\/models\//i.test(trimmed);
-}
-
-function getEffectiveEndpoint(settings = getSettings()) {
-    return normalizeConfiguredEndpoint(settings.apiType, settings.endpoint);
 }
 
 /**
@@ -548,36 +521,66 @@ async function collectPreviousContextReferences(messageId, format, requestedCoun
 }
 
 /**
- * Fetch models list from endpoint
+ * Fetch models list from endpoint safely by extracting base URL
  */
 async function fetchModels() {
     const settings = getSettings();
-    const endpoint = getEffectiveEndpoint(settings);
+    const rawEndpoint = settings.endpoint.trim();
     
-    if (!endpoint || !settings.apiKey) {
+    if (!rawEndpoint || !settings.apiKey) {
         console.warn('[IIG] Cannot fetch models: endpoint or API key not set');
         return [];
     }
     
-    const url = `${endpoint}/v1/models`;
+    // Умный парсинг: отрезаем от ручного эндпоинта генерации специфичные пути, 
+    // чтобы получить чистый базовый URL для запроса моделей.
+    let baseUrl = rawEndpoint.replace(/\/+$/, '');
+    
+    // Убираем пути генерации OpenAI
+    baseUrl = baseUrl.replace(/\/v1\/images\/generations$/i, '');
+    // Убираем пути генерации Gemini (напр. /v1beta/models/nano-banana:generateContent)
+    baseUrl = baseUrl.replace(/\/v1beta\/models\/[^/]+(:generateContent)?$/i, '');
+    // Убираем суффиксы версий
+    baseUrl = baseUrl.replace(/\/(v1|v1beta)$/i, '');
+    // Убираем Naistera суффиксы
+    baseUrl = baseUrl.replace(/\/api\/generate$/i, '');
+
+    let url = `${baseUrl}/v1/models`;
+    let response;
     
     try {
-        const response = await fetch(url, {
+        response = await fetch(url, {
             method: 'GET',
             headers: {
                 'Authorization': `Bearer ${settings.apiKey}`
             }
         });
         
+        // Если для Gemini стандартный путь /v1/models выдал ошибку, попробуем родной /v1beta/models
+        if (!response.ok && settings.apiType === 'gemini') {
+            url = `${baseUrl}/v1beta/models`;
+            response = await fetch(url, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${settings.apiKey}`
+                }
+            });
+        }
+        
         if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
+            throw new Error(`HTTP ${response.status} (запрос на ${url})`);
         }
         
         const data = await response.json();
-        const models = data.data || [];
+        // Поддерживаем как стандартный формат OpenAI (data.data), так и формат некоторых Gemini-прокси (data.models)
+        const modelsList = data.data || data.models || (Array.isArray(data) ? data : []);
         
-        // Filter for image models only
-        return models.filter(m => isImageModel(m.id)).map(m => m.id);
+        // Фильтруем и возвращаем только модели для генерации картинок
+        return modelsList.filter(m => {
+            const id = m.id || m.name;
+            return id && isImageModel(id);
+        }).map(m => m.id || m.name);
+        
     } catch (error) {
         console.error('[IIG] Failed to fetch models:', error);
         toastr.error(`Ошибка загрузки моделей: ${error.message}`, 'Генерация картинок');
@@ -1090,7 +1093,7 @@ async function getUserAvatarBase64() {
  */
 async function generateImageOpenAI(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
-    // ВАЖНО: Используем эндпоинт целиком, без автоматического дописывания /v1/images/generations
+    // ИСПОЛЬЗУЕМ ЭНДПОИНТ ТОЧНО КАК ВВЕДЕНО В НАСТРОЙКАХ
     const url = settings.endpoint.trim();
     
     // Combine style and prompt
@@ -1162,8 +1165,7 @@ const VALID_IMAGE_SIZES = ['1K', '2K', '4K'];
  */
 async function generateImageGemini(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
-    const model = settings.model;
-    // ВАЖНО: Используем эндпоинт целиком, без автоматического дописывания /v1beta/models/...
+    // ИСПОЛЬЗУЕМ ЭНДПОИНТ ТОЧНО КАК ВВЕДЕНО В НАСТРОЙКАХ
     const url = settings.endpoint.trim();
     
     // Determine aspect ratio: tag option > settings, with validation
@@ -1209,6 +1211,7 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
     console.log(`[IIG] Gemini request: ${referenceImages.length} reference image(s) + prompt (${fullPrompt.length} chars)`);
     
     const body = {
+        model: settings.model, // Добавляем модель в тело на случай, если прокси читает её отсюда
         contents: [{
             role: 'user',
             parts: parts
@@ -1222,8 +1225,7 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
         }
     };
     
-    // Log full request config for debugging 400 errors
-    iigLog('INFO', `Gemini request config: model=${model}, aspectRatio=${aspectRatio}, imageSize=${imageSize}, promptLength=${fullPrompt.length}, refImages=${referenceImages.length}`);
+    iigLog('INFO', `Gemini request config: model=${settings.model}, aspectRatio=${aspectRatio}, imageSize=${imageSize}, promptLength=${fullPrompt.length}, refImages=${referenceImages.length}`);
     
     const response = await fetch(url, {
         method: 'POST',
@@ -1281,14 +1283,11 @@ async function getUserAvatarDataUrl() {
 
 /**
  * Generate image via Naistera custom endpoint
- * POST {endpoint}/api/generate
- * Auth: Authorization: Bearer <token>
- * Response: { data_url, content_type, media_kind?, poster_data_url? }
  */
 async function generateImageNaistera(prompt, style, options = {}) {
     const settings = getSettings();
-    const endpoint = getEffectiveEndpoint(settings);
-    const url = endpoint.endsWith('/api/generate') ? endpoint : `${endpoint}/api/generate`;
+    const endpoint = settings.endpoint.trim() || DEFAULT_ENDPOINTS.naistera;
+    const url = endpoint.endsWith('/api/generate') ? endpoint : `${endpoint.replace(/\/+$/, '')}/api/generate`;
 
     const aspectRatio = options.aspectRatio || settings.naisteraAspectRatio || '1:1';
     const model = normalizeNaisteraModel(options.model || settings.naisteraModel || 'grok');
@@ -1610,10 +1609,6 @@ function rerenderMessageHtml(context, message, settings, messageId, mesTextEl) {
 
 /**
  * Generate image with retry logic
- * @param {string} prompt - Image description
- * @param {string} style - Style tag
- * @param {function} onStatusUpdate - Status callback
- * @param {object} options - Additional options (aspectRatio, quality)
  */
 async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {}) {
     // Validate settings first
@@ -1800,20 +1795,12 @@ async function checkFileExists(path) {
 
 /**
  * Parse image generation tags from message text
- * Supports two formats:
- * 1. NEW: <img|video data-iig-instruction='{"style":"...","prompt":"..."}' src="...">
- * 2. LEGACY: [IMG:GEN:{"style":"...","prompt":"..."}]
- * * @param {string} text - Message text
- * @param {object} options - Options
- * @param {boolean} options.checkExistence - Check if image files exist (for hallucination detection)
- * @param {boolean} options.forceAll - Include all instruction tags even with valid paths (for regeneration)
  */
 async function parseImageTags(text, options = {}) {
     const { checkExistence = false, forceAll = false } = options;
     const tags = [];
     
     // === NEW FORMAT: <img|video data-iig-instruction="{...}" src="..."> ===
-    // LLM often generates broken HTML with unescaped quotes, so we parse manually
     const imgTagMarker = 'data-iig-instruction=';
     let searchPos = 0;
     
@@ -1916,7 +1903,7 @@ async function parseImageTags(text, options = {}) {
         // Skip error images - user must click to retry manually (prevents conflict on swipe)
         if (hasErrorImage && !forceAll) {
             iigLog('INFO', `Skipping error image (click to retry): ${srcValue.substring(0, 50)}`);
-            searchPos = imgEnd;
+            searchPos = mediaEnd;
             continue;
         }
         
@@ -1940,12 +1927,12 @@ async function parseImageTags(text, options = {}) {
         } else if (hasPath) {
             // Has path but not checking existence - skip
             iigLog('INFO', `Skipping path (no existence check): ${srcValue.substring(0, 50)}`);
-            searchPos = imgEnd;
+            searchPos = mediaEnd;
             continue;
         }
         
         if (!needsGeneration) {
-            searchPos = imgEnd;
+            searchPos = mediaEnd;
             continue;
         }
         
@@ -2080,8 +2067,7 @@ function createLoadingPlaceholder(tagId) {
 const ERROR_IMAGE_PATH = '/scripts/extensions/third-party/sillyimages/error.svg';
 
 /**
- * Create error placeholder element - just shows error.svg, no click handlers
- * User uses the regenerate button in message menu to retry
+ * Create error placeholder element
  */
 function createErrorPlaceholder(tagId, errorMessage, tagInfo) {
     const img = document.createElement('img');
@@ -2168,18 +2154,12 @@ async function processMessageTags(messageId) {
         const allImgs = mesTextEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]');
         iigLog('INFO', `Searching for media element. Found ${allImgs.length} [data-iig-instruction] elements in DOM`);
         
-        // Debug: log what we're looking for vs what's in DOM
         const searchPrompt = tag.prompt.substring(0, 30);
-        iigLog('INFO', `Searching for prompt starting with: "${searchPrompt}"`);
         
         for (const img of allImgs) {
             const instruction = img.getAttribute('data-iig-instruction');
-            const src = img.getAttribute('src') || '';
-            iigLog('INFO', `DOM img - src: "${src.substring(0, 50)}", instruction (first 100): "${instruction?.substring(0, 100)}"`);
             
-            // Try multiple matching strategies
             if (instruction) {
-                // Strategy 1: Decode HTML entities and normalize quotes, then match
                 const decodedInstruction = instruction
                     .replace(/&quot;/g, '"')
                     .replace(/&apos;/g, "'")
@@ -2187,7 +2167,6 @@ async function processMessageTags(messageId) {
                     .replace(/&#34;/g, '"')
                     .replace(/&amp;/g, '&');
                 
-                // Also normalize the search prompt the same way
                 const normalizedSearchPrompt = searchPrompt
                     .replace(/&quot;/g, '"')
                     .replace(/&apos;/g, "'")
@@ -2195,68 +2174,50 @@ async function processMessageTags(messageId) {
                     .replace(/&#34;/g, '"')
                     .replace(/&amp;/g, '&');
                 
-                // Check if decoded instruction contains the prompt
                 if (decodedInstruction.includes(normalizedSearchPrompt)) {
-                    iigLog('INFO', `Found img element via decoded instruction match`);
                     targetElement = img;
                     break;
                 }
                 
-                // Strategy 2: Try to parse the instruction as JSON and compare prompts
                 try {
                     const normalizedJson = decodedInstruction.replace(/'/g, '"');
                     const instructionData = JSON.parse(normalizedJson);
                     if (instructionData.prompt && instructionData.prompt.substring(0, 30) === tag.prompt.substring(0, 30)) {
-                        iigLog('INFO', `Found img element via JSON prompt match`);
                         targetElement = img;
                         break;
                     }
-                } catch (e) {
-                    // JSON parse failed, continue with other strategies
-                }
+                } catch (e) {}
                 
-                // Strategy 3: Raw instruction contains raw search prompt (original approach)
                 if (instruction.includes(searchPrompt)) {
-                    iigLog('INFO', `Found img element via raw instruction match`);
                     targetElement = img;
                     break;
                 }
             }
         }
         
-        // Alternative: find by src containing markers (when prompt matching fails)
         if (!targetElement) {
-            iigLog('INFO', `Prompt matching failed, trying src marker matching...`);
             for (const img of allImgs) {
                 const src = img.getAttribute('src') || '';
-                // Check for generation markers or empty/broken src
                 if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]') || src === '' || src === '#') {
-                    iigLog('INFO', `Found img element with generation marker in src: "${src}"`);
                     targetElement = img;
                     break;
                 }
             }
         }
         
-        // Strategy 4: If still not found, try looking at all media nodes
-        // This handles cases where browser didn't parse data-iig-instruction as a valid attribute
         if (!targetElement) {
-            iigLog('INFO', `Trying broader media search...`);
             const allImgsInMes = mesTextEl.querySelectorAll('img, video');
             for (const img of allImgsInMes) {
                 const src = img.getAttribute('src') || '';
-                // Look for src containing our markers
                 if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]')) {
-                    iigLog('INFO', `Found img via broad search with marker src: "${src.substring(0, 50)}"`);
                     targetElement = img;
                     break;
                 }
             }
         }
         
-        // Replace target with placeholder, preserving parent styling context
+        // Replace target with placeholder
         if (targetElement) {
-            // Copy some styling context from parent for adaptive placeholder
             const parent = targetElement.parentElement;
             if (parent) {
                 const parentStyle = window.getComputedStyle(parent);
@@ -2265,9 +2226,7 @@ async function processMessageTags(messageId) {
                 }
             }
             targetElement.replaceWith(loadingPlaceholder);
-            iigLog('INFO', `Loading placeholder shown (replaced target element)`);
         } else {
-            iigLog('WARN', `Could not find target element, appending placeholder as fallback`);
             mesTextEl.appendChild(loadingPlaceholder);
         }
         
@@ -2327,60 +2286,37 @@ async function processMessageTags(messageId) {
             const updatedTag = buildPersistedMediaTag(tag, generated, persistedSrc, persistedPosterSrc);
             replaceTagInMessageSource(message, tag, updatedTag);
 
-            iigLog('INFO', `Successfully generated ${isGeneratedVideoResult(generated) ? 'video' : 'image'} for tag ${index}`);
             toastr.success(
                 `${isGeneratedVideoResult(generated) ? 'Видео' : 'Картинка'} ${index + 1}/${tags.length} готов${isGeneratedVideoResult(generated) ? 'о' : 'а'}`,
                 'Генерация картинок',
                 { timeOut: 2000 }
             );
         } catch (error) {
-            iigLog('ERROR', `Failed to generate image for tag ${index}:`, error.message);
-            
-            // Replace with error placeholder
             const errorPlaceholder = createErrorPlaceholder(tagId, error.message, tag);
             loadingPlaceholder.replaceWith(errorPlaceholder);
             
-            // IMPORTANT: Mark tag as failed in message.mes - use error.svg path so it displays properly after swipe
             if (tag.isNewFormat) {
-                // NEW FORMAT: update src with error image path (will be detected for retry)
                 const errorTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${ERROR_IMAGE_PATH}"`);
                 replaceTagInMessageSource(message, tag, errorTag);
             } else {
-                // LEGACY FORMAT: replace with error marker
                 const errorMarker = `[IMG:ERROR:${error.message.substring(0, 50)}]`;
                 replaceTagInMessageSource(message, tag, errorMarker);
             }
-            iigLog('INFO', `Marked tag as failed in message.mes`);
             
             toastr.error(`Ошибка генерации: ${error.message}`, 'Генерация картинок');
         }
     };
     
     try {
-        // Process all tags in parallel
         await Promise.all(tags.map((tag, index) => processTag(tag, index)));
     } finally {
-        // Always remove from processing set
         processingMessages.delete(messageId);
-        iigLog('INFO', `Finished processing message ${messageId}`);
     }
     
-    // Save chat to persist changes
     await context.saveChat();
     
-    // Force re-render the message to show updated content
-    // Use SillyTavern's messageFormatting if available
     if (typeof context.messageFormatting === 'function') {
         rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
-        console.log('[IIG] Message re-rendered via messageFormatting');
-    } else {
-        // Fallback: trigger a manual re-render by finding and updating the element
-        const freshMessageEl = document.querySelector(`#chat .mes[mesid="${messageId}"] .mes_text`);
-        if (freshMessageEl && message.mes) {
-            // Simple approach: just reload the message content
-            // This works because message.mes now contains the image path instead of the tag
-            console.log('[IIG] Attempting manual refresh...');
-        }
     }
 }
 
@@ -2397,7 +2333,6 @@ async function regenerateMessageImages(messageId) {
         return;
     }
     
-    // Parse ALL instruction tags, forcing regeneration
     const tags = await parseMessageImageTags(message, { forceAll: true });
     
     if (tags.length === 0) {
@@ -2405,10 +2340,8 @@ async function regenerateMessageImages(messageId) {
         return;
     }
     
-    iigLog('INFO', `Regenerating ${tags.length} images in message ${messageId}`);
     toastr.info(`Перегенерация ${tags.length} картинок...`, 'Генерация картинок');
     
-    // Process using existing logic
     processingMessages.add(messageId);
     
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
@@ -2426,7 +2359,6 @@ async function regenerateMessageImages(messageId) {
     const convertedLegacyTags = convertLegacyTagsToInstructionFormat(message, tags);
     if (convertedLegacyTags > 0) {
         rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
-        iigLog('INFO', `Converted ${convertedLegacyTags} legacy tag(s) to instruction tags before regeneration`);
     }
     
     for (let index = 0; index < tags.length; index++) {
@@ -2434,13 +2366,11 @@ async function regenerateMessageImages(messageId) {
         const tagId = `iig-regen-${messageId}-${index}`;
         
         try {
-            // Find the existing rendered media element with data-iig-instruction
             const existingMediaList = Array.from(
                 mesTextEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]')
             );
             const existingMedia = existingMediaList[index] || existingMediaList[0] || null;
             if (existingMedia) {
-                // Preserve the instruction for future regenerations
                 const instruction = existingMedia.getAttribute('data-iig-instruction');
                 
                 const loadingPlaceholder = createLoadingPlaceholder(tagId);
@@ -2495,7 +2425,6 @@ async function regenerateMessageImages(messageId) {
                 }
                 loadingPlaceholder.replaceWith(mediaElement);
                 
-                // Update message.mes
                 const updatedTag = buildPersistedMediaTag(tag, generated, persistedSrc, persistedPosterSrc);
                 replaceTagInMessageSource(message, tag, updatedTag);
                 
@@ -2506,7 +2435,6 @@ async function regenerateMessageImages(messageId) {
                 );
             }
         } catch (error) {
-            iigLog('ERROR', `Regeneration failed for tag ${index}:`, error.message);
             toastr.error(`Ошибка: ${error.message}`, 'Генерация картинок');
         }
     }
@@ -2514,17 +2442,14 @@ async function regenerateMessageImages(messageId) {
     processingMessages.delete(messageId);
     await context.saveChat();
     rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
-    iigLog('INFO', `Regeneration complete for message ${messageId}`);
 }
 
 /**
  * Add regenerate button to message extra menu (three dots)
  */
 function addRegenerateButton(messageElement, messageId) {
-    // Check if button already exists
     if (messageElement.querySelector('.iig-regenerate-btn')) return;
     
-    // Find the extraMesButtons container (three dots menu)
     const extraMesButtons = messageElement.querySelector('.extraMesButtons');
     if (!extraMesButtons) return;
     
@@ -2548,7 +2473,6 @@ function addButtonsToExistingMessages() {
     if (!context.chat || context.chat.length === 0) return;
     
     const messageElements = document.querySelectorAll('#chat .mes');
-    let addedCount = 0;
     
     for (const messageElement of messageElements) {
         const mesId = messageElement.getAttribute('mesid');
@@ -2557,40 +2481,24 @@ function addButtonsToExistingMessages() {
         const messageId = parseInt(mesId, 10);
         const message = context.chat[messageId];
         
-        // Only add to AI messages (not user messages)
         if (message && !message.is_user) {
             addRegenerateButton(messageElement, messageId);
-            addedCount++;
         }
     }
-    
-    iigLog('INFO', `Added regenerate buttons to ${addedCount} existing messages`);
 }
-
-// NOTE: No click handlers on error images - user uses the regenerate button in message menu
 
 /**
  * Handle CHARACTER_MESSAGE_RENDERED event
- * This fires AFTER the message is rendered to DOM
  */
 async function onMessageReceived(messageId) {
-    iigLog('INFO', `onMessageReceived: ${messageId}`);
-    
     const settings = getSettings();
-    if (!settings.enabled) {
-        iigLog('INFO', 'Extension disabled, skipping');
-        return;
-    }
+    if (!settings.enabled) return;
     
     const context = SillyTavern.getContext();
-    const message = context.chat[messageId];
-    
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
     if (!messageElement) return;
     
-    // Always add regenerate button for AI messages
     addRegenerateButton(messageElement, messageId);
-    
     await processMessageTags(messageId);
 }
 
@@ -2602,10 +2510,7 @@ function createSettingsUI() {
     const context = SillyTavern.getContext();
     
     const container = document.getElementById('extensions_settings');
-    if (!container) {
-        console.error('[IIG] Settings container not found');
-        return;
-    }
+    if (!container) return;
     
     const html = `
         <div class="inline-drawer">
@@ -2894,17 +2799,14 @@ function bindSettingsEvents() {
         const isGemini = apiType === 'gemini';
         const isOpenAI = apiType === 'openai';
 
-        // Model is used for OpenAI and Gemini; Naistera does not need a model.
         document.getElementById('iig_model_row')?.classList.toggle('iig-hidden', isNaistera);
         document.getElementById('iig_image_context_section')?.classList.toggle('iig-hidden', !(isNaistera || isGemini));
         document.getElementById('iig_image_context_count_row')?.classList.toggle('iig-hidden', !((isNaistera || isGemini) && settings.imageContextEnabled));
         document.getElementById('iig_additional_refs_section')?.classList.toggle('iig-hidden', !(isNaistera || isGemini));
 
-        // OpenAI-only params
         document.getElementById('iig_size_row')?.classList.toggle('iig-hidden', !isOpenAI);
         document.getElementById('iig_quality_row')?.classList.toggle('iig-hidden', !isOpenAI);
 
-        // Naistera-only params
         document.getElementById('iig_naistera_model_row')?.classList.toggle('iig-hidden', !isNaistera);
         document.getElementById('iig_naistera_aspect_row')?.classList.toggle('iig-hidden', !isNaistera);
         document.getElementById('iig_naistera_video_section')?.classList.toggle('iig-hidden', !isNaistera);
@@ -2923,7 +2825,6 @@ function bindSettingsEvents() {
             endpointInput.placeholder = getEndpointPlaceholder(apiType);
         }
 
-        // Avatar section is only for Gemini/nano-banana
         const avatarSection = document.getElementById('iig_avatar_section');
         if (avatarSection) {
             avatarSection.classList.toggle('hidden', !isGemini);
@@ -2939,7 +2840,6 @@ function bindSettingsEvents() {
         );
     };
     
-    // Enable toggle
     document.getElementById('iig_enabled')?.addEventListener('change', (e) => {
         settings.enabled = e.target.checked;
         saveSettings();
@@ -2965,37 +2865,29 @@ function bindSettingsEvents() {
     
     // API Type
     document.getElementById('iig_api_type')?.addEventListener('change', (e) => {
-        const nextApiType = e.target.value;
-        const endpointInput = document.getElementById('iig_endpoint');
-        if (shouldReplaceEndpointForApiType(nextApiType, settings.endpoint)) {
-            settings.endpoint = normalizeConfiguredEndpoint(nextApiType, '');
-            if (endpointInput) {
-                endpointInput.value = settings.endpoint;
-            }
-        } else if (nextApiType === 'naistera') {
-            settings.endpoint = normalizeConfiguredEndpoint(nextApiType, settings.endpoint);
+        settings.apiType = e.target.value;
+        // Больше никакого автоматического изменения URL пользователя, кроме случая с Naistera при пустом поле
+        if (settings.apiType === 'naistera' && !settings.endpoint) {
+            settings.endpoint = DEFAULT_ENDPOINTS.naistera;
+            const endpointInput = document.getElementById('iig_endpoint');
             if (endpointInput) {
                 endpointInput.value = settings.endpoint;
             }
         }
-        settings.apiType = nextApiType;
         saveSettings();
         updateVisibility();
     });
     
-    // Endpoint
     document.getElementById('iig_endpoint')?.addEventListener('input', (e) => {
         settings.endpoint = e.target.value;
         saveSettings();
     });
     
-    // API Key
     document.getElementById('iig_api_key')?.addEventListener('input', (e) => {
         settings.apiKey = e.target.value;
         saveSettings();
     });
     
-    // API Key toggle visibility
     document.getElementById('iig_key_toggle')?.addEventListener('click', () => {
         const input = document.getElementById('iig_api_key');
         const icon = document.querySelector('#iig_key_toggle i');
@@ -3008,12 +2900,10 @@ function bindSettingsEvents() {
         }
     });
     
-    // Model
     document.getElementById('iig_model')?.addEventListener('change', (e) => {
         settings.model = e.target.value;
         saveSettings();
         
-        // Auto-switch API type based on model
         if (isGeminiModel(e.target.value)) {
             document.getElementById('iig_api_type').value = 'gemini';
             settings.apiType = 'gemini';
@@ -3021,7 +2911,6 @@ function bindSettingsEvents() {
         }
     });
     
-    // Refresh models
     document.getElementById('iig_refresh_models')?.addEventListener('click', async (e) => {
         const btn = e.currentTarget;
         btn.classList.add('loading');
@@ -3030,7 +2919,6 @@ function bindSettingsEvents() {
             const models = await fetchModels();
             const select = document.getElementById('iig_model');
             
-            // Keep current selection if it exists in new list
             const currentModel = settings.model;
             
             select.innerHTML = '<option value="">-- Выберите модель --</option>';
@@ -3045,43 +2933,37 @@ function bindSettingsEvents() {
             
             toastr.success(`Найдено моделей: ${models.length}`, 'Генерация картинок');
         } catch (error) {
-            toastr.error('Ошибка загрузки моделей', 'Генерация картинок');
+            // Toastr is handled inside fetchModels
         } finally {
             btn.classList.remove('loading');
         }
     });
     
-    // Size
     document.getElementById('iig_size')?.addEventListener('change', (e) => {
         settings.size = e.target.value;
         saveSettings();
     });
     
-    // Quality
     document.getElementById('iig_quality')?.addEventListener('change', (e) => {
         settings.quality = e.target.value;
         saveSettings();
     });
     
-    // Aspect Ratio (nano-banana)
     document.getElementById('iig_aspect_ratio')?.addEventListener('change', (e) => {
         settings.aspectRatio = e.target.value;
         saveSettings();
     });
     
-    // Image Size (nano-banana)
     document.getElementById('iig_image_size')?.addEventListener('change', (e) => {
         settings.imageSize = e.target.value;
         saveSettings();
     });
 
-    // Naistera aspect ratio
     document.getElementById('iig_naistera_model')?.addEventListener('change', (e) => {
         settings.naisteraModel = normalizeNaisteraModel(e.target.value);
         saveSettings();
     });
 
-    // Naistera aspect ratio
     document.getElementById('iig_naistera_aspect_ratio')?.addEventListener('change', (e) => {
         settings.naisteraAspectRatio = e.target.value;
         saveSettings();
@@ -3100,7 +2982,6 @@ function bindSettingsEvents() {
         saveSettings();
     });
 
-    // Naistera references (UI only for now)
     document.getElementById('iig_naistera_send_char_avatar')?.addEventListener('change', (e) => {
         settings.naisteraSendCharAvatar = e.target.checked;
         saveSettings();
@@ -3118,21 +2999,18 @@ function bindSettingsEvents() {
         updateVisibility();
     });
 
-    // Naistera user avatar file selection (reuses settings.userAvatarFile)
     document.getElementById('iig_naistera_user_avatar_file')?.addEventListener('change', (e) => {
         settings.userAvatarFile = e.target.value;
         syncUserAvatarSelection(settings.userAvatarFile);
         saveSettings();
     });
 
-    // Naistera refresh user avatars list
     document.getElementById('iig_naistera_refresh_avatars')?.addEventListener('click', async (e) => {
         const btn = e.currentTarget;
         btn.classList.add('loading');
 
         try {
             const avatars = await refreshUserAvatarSelects();
-
             toastr.success(`Найдено аватаров: ${avatars.length}`, 'Генерация картинок');
         } catch (error) {
             toastr.error('Ошибка загрузки аватаров', 'Генерация картинок');
@@ -3141,13 +3019,11 @@ function bindSettingsEvents() {
         }
     });
     
-    // Send char avatar
     document.getElementById('iig_send_char_avatar')?.addEventListener('change', (e) => {
         settings.sendCharAvatar = e.target.checked;
         saveSettings();
     });
     
-    // Send user avatar
     document.getElementById('iig_send_user_avatar')?.addEventListener('change', (e) => {
         settings.sendUserAvatar = e.target.checked;
         saveSettings();
@@ -3161,21 +3037,18 @@ function bindSettingsEvents() {
         updateVisibility();
     });
     
-    // User avatar file selection
     document.getElementById('iig_user_avatar_file')?.addEventListener('change', (e) => {
         settings.userAvatarFile = e.target.value;
         syncUserAvatarSelection(settings.userAvatarFile);
         saveSettings();
     });
 
-    // Refresh user avatars list
     document.getElementById('iig_refresh_avatars')?.addEventListener('click', async (e) => {
         const btn = e.currentTarget;
         btn.classList.add('loading');
         
         try {
             const avatars = await refreshUserAvatarSelects();
-            
             toastr.success(`Найдено аватаров: ${avatars.length}`, 'Генерация картинок');
         } catch (error) {
             toastr.error('Ошибка загрузки аватаров', 'Генерация картинок');
@@ -3307,19 +3180,16 @@ function bindSettingsEvents() {
         renderAdditionalReferencesList();
     });
     
-    // Max retries
     document.getElementById('iig_max_retries')?.addEventListener('input', (e) => {
         settings.maxRetries = parseInt(e.target.value) || 3;
         saveSettings();
     });
     
-    // Retry delay
     document.getElementById('iig_retry_delay')?.addEventListener('input', (e) => {
         settings.retryDelay = parseInt(e.target.value) || 1000;
         saveSettings();
     });
     
-    // Export logs
     document.getElementById('iig_export_logs')?.addEventListener('click', () => {
         exportLogs();
     });
@@ -3337,45 +3207,25 @@ function bindSettingsEvents() {
 (function init() {
     const context = SillyTavern.getContext();
     
-    // Debug: log available event types
-    console.log('[IIG] Available event_types:', context.event_types);
-    console.log('[IIG] CHARACTER_MESSAGE_RENDERED:', context.event_types.CHARACTER_MESSAGE_RENDERED);
-    console.log('[IIG] MESSAGE_SWIPED:', context.event_types.MESSAGE_SWIPED);
-    
-    // Load settings
     getSettings();
     
-    // Create settings UI when app is ready
     context.eventSource.on(context.event_types.APP_READY, () => {
         createSettingsUI();
-        // Add buttons to any messages already in chat
         addButtonsToExistingMessages();
         console.log('[IIG] Inline Image Generation extension loaded');
     });
     
-    // When chat is loaded/changed, add buttons to all existing messages
     context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
-        iigLog('INFO', 'CHAT_CHANGED event - adding buttons to existing messages');
-        // Small delay to ensure DOM is ready
         setTimeout(() => {
             addButtonsToExistingMessages();
         }, 100);
     });
     
-    // Wrapper to add debug logging
     const handleMessage = async (messageId) => {
-        console.log('[IIG] Event triggered for message:', messageId);
         await onMessageReceived(messageId);
     };
     
-    // Listen for new messages AFTER they're rendered in DOM
-    // CHARACTER_MESSAGE_RENDERED fires after addOneMessage() completes
-    // This is the ONLY event we handle - no auto-retry on swipe/update
     context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, handleMessage);
-    
-    // NOTE: We intentionally DO NOT handle MESSAGE_SWIPED or MESSAGE_UPDATED
-    // Swipe = user wants NEW content, not to retry old error images
-    // If user wants to retry failed images, they use the regenerate button in menu
     
     console.log('[IIG] Inline Image Generation extension initialized');
 })();
